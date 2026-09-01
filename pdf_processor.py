@@ -4,10 +4,11 @@ pdf_processor.py — PDF 처리 모듈
 PyMuPDF(fitz)를 사용하여:
 1. 스캔 PDF → 페이지별 이미지(numpy array) 변환
 2. 원본 페이지 위에 투명 텍스트 레이어를 삽입하여 검색 가능한 PDF 생성
+
+주의: OCR bbox는 이미지 픽셀 좌표이므로 PDF 포인트 좌표로 역변환(÷zoom) 필요.
 """
 
 import os
-import sys
 import logging
 from typing import List, Tuple, Optional
 
@@ -16,21 +17,32 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# ── 폰트 캐시 (프로세스당 한 번만 탐색) ───────────────────────────────
+_FONT_CACHE: Optional[str] = ...  # sentinel
+
 
 def _find_korean_font() -> Optional[str]:
-    """시스템에서 한국어 지원 트루타입 폰트 경로 탐색"""
-    font_candidates = [
-        "C:/Windows/Fonts/malgun.ttf",       # 맑은 고딕
-        "C:/Windows/Fonts/malgunbd.ttf",     # 맑은 고딕 볼드
-        "C:/Windows/Fonts/gulim.ttc",        # 굴림
-        "C:/Windows/Fonts/batang.ttc",       # 바탕
-        "C:/Windows/Fonts/arial.ttf",        # 영문 폴백
-        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",  # Linux
-        "/System/Library/Fonts/AppleGothic.ttf",             # macOS
+    """시스템에서 한국어 지원 트루타입 폰트 경로를 탐색하고 캐시."""
+    global _FONT_CACHE
+    if _FONT_CACHE is not ...:
+        return _FONT_CACHE
+
+    candidates = [
+        "C:/Windows/Fonts/malgun.ttf",       # 맑은 고딕 (Windows 기본)
+        "C:/Windows/Fonts/malgunbd.ttf",
+        "C:/Windows/Fonts/gulim.ttc",
+        "C:/Windows/Fonts/batang.ttc",
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "/System/Library/Fonts/AppleGothic.ttf",
     ]
-    for p in font_candidates:
+    for p in candidates:
         if os.path.isfile(p):
-            return p
+            logger.info(f"한국어 폰트 발견: {p}")
+            _FONT_CACHE = p
+            return _FONT_CACHE
+
+    logger.warning("한국어 폰트를 찾을 수 없습니다. 기본 라틴 폰트(helv)를 사용합니다.")
+    _FONT_CACHE = None
     return None
 
 
@@ -43,7 +55,7 @@ def pdf_to_images(
 
     Args:
         pdf_path: PDF 파일 경로
-        dpi: 렌더링 해상도 (200~300 권장, 기본 250)
+        dpi: 렌더링 해상도 (200~300 권장)
 
     Returns:
         (doc, pixmaps) 튜플
@@ -58,18 +70,17 @@ def pdf_to_images(
         pix = page.get_pixmap(matrix=mat)
         pixmaps.append(pix)
 
-    logger.info(f"PDF → 이미지 변환 완료: {len(pixmaps)}페이지, {dpi}DPI")
+    logger.info(f"PDF → 이미지 변환 완료: {len(pixmaps)}페이지 @ {dpi}DPI")
     return doc, pixmaps
 
 
 def pixmap_to_numpy(pix: fitz.Pixmap) -> np.ndarray:
-    """fitz.Pixmap을 numpy array(RGB)로 변환"""
+    """fitz.Pixmap → numpy array (RGB, uint8)"""
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
         pix.height, pix.width, pix.n
     )
-    # RGBA → RGB 변환 (알파 채널 제거)
-    if pix.n >= 4:
-        img = img[:, :, :3]
+    if pix.n >= 4:  # RGBA → RGB
+        img = img[:, :, :3].copy()
     return img
 
 
@@ -80,17 +91,20 @@ def build_searchable_pdf(
     dpi: int = 250,
 ) -> None:
     """
-    원본 PDF 페이지 위에 OCR 인식 텍스트를 투명 레이어로 삽입하여
-    검색 가능한 PDF를 생성.
+    원본 PDF 위에 투명 텍스트 레이어를 삽입하여 검색 가능한 PDF 생성.
+
+    원본 스캔 이미지를 그대로 보존하면서 Ctrl+F 검색 / 텍스트 복사가 가능.
 
     Args:
-        doc: fitz.Document (pdf_to_images에서 반환된 동일 객체)
-        ocr_results_per_page: 페이지별 OCR 결과 리스트 [[(bbox, text, score), ...], ...]
-        output_path: 출력 PDF 파일 경로
-        dpi: 렌더링 시 사용한 DPI
+        doc: pdf_to_images에서 반환된 fitz.Document (수정 후 저장됨)
+        ocr_results_per_page: 페이지별 [(bbox_4points, text, score), ...]
+        output_path: 출력 PDF 경로
+        dpi: pdf_to_images에서 사용한 것과 동일한 DPI
     """
-    zoom = dpi / 72.0  # 이미지 픽셀 좌표 → PDF 포인트 좌표 변환 비율
+    zoom = dpi / 72.0
     font_file = _find_korean_font()
+    text_count = 0
+    skip_count = 0
 
     for page_idx, results in enumerate(ocr_results_per_page):
         if not results:
@@ -98,7 +112,7 @@ def build_searchable_pdf(
 
         page = doc[page_idx]
 
-        # 폰트 등록 (한국어 지원 폰트)
+        # ── 한국어 폰트를 이 페이지에 등록 ──
         fontname = "ocr_font"
         try:
             if font_file:
@@ -115,47 +129,50 @@ def build_searchable_pdf(
             if not text or not text.strip():
                 continue
 
-            # bbox: [[x0,y0],[x1,y1],[x2,y2],[x3,y3]] (이미지 픽셀 좌표)
-            xs = [pt[0] for pt in bbox]
-            ys = [pt[1] for pt in bbox]
+            # ── bbox(이미지 픽셀) → PDF 포인트 좌표 변환 ──
+            try:
+                xs = [float(pt[0]) for pt in bbox]
+                ys = [float(pt[1]) for pt in bbox]
+            except (TypeError, IndexError):
+                skip_count += 1
+                continue
+
             x0 = min(xs) / zoom
             y0 = min(ys) / zoom
             x1 = max(xs) / zoom
             y1 = max(ys) / zoom
 
-            rect = fitz.Rect(x0, y0, x1, y1)
-            rect_height = y1 - y0
-            rect_width = x1 - x0
-
-            if rect_height <= 0 or rect_width <= 0:
+            rect_h = y1 - y0
+            rect_w = x1 - x0
+            if rect_h <= 0 or rect_w <= 0:
                 continue
 
-            # 글자 크기 추산 (박스 높이 기준)
-            fontsize = max(1.0, rect_height * 0.75)
+            rect = fitz.Rect(x0, y0, x1, y1)
+            fontsize = max(1.0, rect_h * 0.75)
 
-            try:
-                # render_mode=3: 투명 텍스트 (시각적으로 숨겨지고 검색/복사 가능)
-                page.insert_textbox(
-                    rect,
-                    text,
-                    fontsize=fontsize,
-                    fontname=fontname,
-                    render_mode=3,
-                )
-            except Exception as e:
-                # 폰트 에러 시 기본 helv 폰트로 재시도
+            # ── 투명 텍스트 삽입 (render_mode=3) ──
+            inserted = False
+            for fn in (fontname, "helv"):
                 try:
                     page.insert_textbox(
-                        rect,
-                        text,
+                        rect, text,
                         fontsize=fontsize,
-                        fontname="helv",
+                        fontname=fn,
                         render_mode=3,
                     )
-                except Exception as e2:
-                    logger.debug(f"텍스트 삽입 건너뜀 [{text}]: {e2}")
+                    inserted = True
+                    break
+                except Exception:
                     continue
+
+            if inserted:
+                text_count += 1
+            else:
+                skip_count += 1
 
     doc.save(output_path, garbage=4, deflate=True)
     doc.close()
-    logger.info(f"검색 가능한 PDF 저장 완료: {output_path}")
+    logger.info(
+        f"검색 가능한 PDF 저장 완료: {output_path} "
+        f"(텍스트 {text_count}개 삽입, {skip_count}개 건너뜀)"
+    )

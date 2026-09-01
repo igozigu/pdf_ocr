@@ -1,16 +1,22 @@
 # PDF OCR 도구 — 의존성 목록
 #
-# GPU 버전:
-#   pip install paddlepaddle-gpu
-# CPU 전용:
-#   pip install paddlepaddle
+# 핵심 OCR 엔진 (둘 중 하나 이상 필요, 둘 다 설치하면 자동 선택):
+#   pip install easyocr        ← 기본 엔진 (PyInstaller 호환 우수)
+#   pip install paddleocr      ← 고속 엔진 (paddlepaddle 필요)
+#   pip install paddlepaddle   ← PaddleOCR용 (CPU 전용, Windows 권장: ==2.6.2)
 #
-# CUDA 버전에 맞는 paddlepaddle-gpu를 선택하세요:
-#   - CUDA 11.8: pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
-#   - CUDA 12.x: pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu123/
+# GPU 사용 시:
+#   easyocr: torch CUDA 버전 설치 → pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#   paddleocr: pip install paddlepaddle-gpu
 
-paddleocr>=2.7
+# ── 필수 ──
+easyocr>=1.7
 pymupdf>=1.23
-tkinterdnd2>=0.3
-pyinstaller>=6.0
 numpy
+
+# ── 드래그앤드롭 (둘 중 하나) ──
+windnd>=1.0.7
+tkinterdnd2>=0.3
+
+# ── 패키징 ──
+pyinstaller>=6.0
