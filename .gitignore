@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+venv/
+env/
+ENV/
+
+# Build & Packaging
+build/
+dist/
+*.spec
+*.exe
+
+# Test files & logs
+logs/
+test_*.pdf
+*.log
+
+# Models cache (if any)
+.paddlex/
+.paddleocr/

@@ -1,0 +1,16 @@
+# PDF OCR 도구 — 의존성 목록
+#
+# GPU 버전:
+#   pip install paddlepaddle-gpu
+# CPU 전용:
+#   pip install paddlepaddle
+#
+# CUDA 버전에 맞는 paddlepaddle-gpu를 선택하세요:
+#   - CUDA 11.8: pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
+#   - CUDA 12.x: pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu123/
+
+paddleocr>=2.7
+pymupdf>=1.23
+tkinterdnd2>=0.3
+pyinstaller>=6.0
+numpy
