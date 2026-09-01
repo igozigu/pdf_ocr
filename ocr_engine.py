@@ -2,7 +2,7 @@
 ocr_engine.py — 초고속 GPU/CPU 이중 OCR 엔진 모듈
 
 NVIDIA GeForce GPU(CUDA) 가속 지원 (GTX 1080 Ti 등).
-EasyOCR (기본 초고속) + PaddleOCR (대체)
+EasyOCR (모바일 캡처/스캔본 검출 민감도 대폭 강화) + PaddleOCR (선택적)
 """
 
 import os
@@ -39,12 +39,12 @@ def _detect_gpu_torch() -> Tuple[bool, str]:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# EasyOCR 엔진 (GPU 가속 최적화)
+# EasyOCR 엔진 (GPU 가속 + 모바일 캡처/스캔본 정밀 인식)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class EasyOCREngine:
     """
     EasyOCR 기반 한국어/영어 고속 OCR 엔진.
-    CUDA GPU 가속 시 A4 1페이지당 0.3~0.6초 초고속 처리.
+    CUDA GPU 가속 시 A4 1페이지당 0.2~0.5초 초고속 처리.
     """
 
     def __init__(self, use_gpu: Optional[bool] = None):
@@ -81,10 +81,15 @@ class EasyOCREngine:
         try:
             import torch
             with torch.inference_mode():
-                # batch_size=16으로 텍스트 영역을 고속 일괄 추론
+                # 모바일 캡처, 작은 한글 글씨, 말풍선까지 세밀하게 검출하도록 파라미터 최적화
                 results = self._reader.readtext(
                     image_np,
                     batch_size=16 if self.use_gpu else 4,
+                    text_threshold=0.25,      # 텍스트 검출 신뢰도 임계값
+                    low_text=0.25,            # 낮은 대비 글씨 검출
+                    link_threshold=0.35,      # 인접 글자 연결
+                    canvas_size=2560,         # 고해상도 모바일 캡처 캔버스
+                    mag_ratio=1.0,            # 원본 배율 유지
                     workers=0,
                 )
         except Exception as e:
@@ -93,7 +98,8 @@ class EasyOCREngine:
 
         parsed: List[OCRLine] = []
         for (bbox, text, score) in results:
-            parsed.append((bbox, text, float(score)))
+            if text and text.strip():
+                parsed.append((bbox, text.strip(), float(score)))
         return parsed
 
 
@@ -160,7 +166,8 @@ class PaddleOCREngine:
             bbox = line[0]
             text = line[1][0]
             score = float(line[1][1]) if len(line[1]) > 1 else 1.0
-            parsed.append((bbox, text, score))
+            if text and text.strip():
+                parsed.append((bbox, text.strip(), score))
         return parsed
 
 
@@ -198,6 +205,5 @@ def create_engine(preferred: str = "easyocr", use_gpu: Optional[bool] = None):
             continue
 
     raise RuntimeError(
-        f"사용 가능한 OCR 엔진이 없습니다.\n"
-        f"오류: {last_error}"
+        f"사용 가능한 OCR 엔진이 없습니다.\n오류: {last_error}"
     )

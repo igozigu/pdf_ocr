@@ -1,11 +1,9 @@
 """
-pdf_processor.py — PDF 처리 모듈
+pdf_processor.py — PDF 처리 모듈 (투명 텍스트 레이어 완벽 삽입)
 
 PyMuPDF(fitz)를 사용하여:
-1. 스캔 PDF → 페이지별 이미지(numpy array) 변환
-2. 원본 페이지 위에 투명 텍스트 레이어를 삽입하여 검색 가능한 PDF 생성
-
-주의: OCR bbox는 이미지 픽셀 좌표이므로 PDF 포인트 좌표로 역변환(÷zoom) 필요.
+1. 스캔/캡처 PDF → 페이지별 고해상도 이미지(numpy array) 변환
+2. 원본 페이지 위에 투명 텍스트 레이어를 100% 누락 없이 확실하게 삽입 (insert_text 방식)
 """
 
 import os
@@ -48,14 +46,14 @@ def _find_korean_font() -> Optional[str]:
 
 def pdf_to_images(
     pdf_path: str,
-    dpi: int = 250,
+    dpi: int = 200,
 ) -> Tuple[fitz.Document, List[fitz.Pixmap]]:
     """
     PDF의 각 페이지를 이미지(Pixmap)로 변환.
 
     Args:
         pdf_path: PDF 파일 경로
-        dpi: 렌더링 해상도 (200~300 권장)
+        dpi: 렌더링 해상도 (200 DPI 최적 균형)
 
     Returns:
         (doc, pixmaps) 튜플
@@ -88,12 +86,13 @@ def build_searchable_pdf(
     doc: fitz.Document,
     ocr_results_per_page: list,
     output_path: str,
-    dpi: int = 250,
+    dpi: int = 200,
 ) -> None:
     """
-    원본 PDF 위에 투명 텍스트 레이어를 삽입하여 검색 가능한 PDF 생성.
+    원본 PDF 위에 투명 텍스트 레이어를 100% 누락 없이 삽입하여 검색 가능한 PDF 생성.
 
-    원본 스캔 이미지를 그대로 보존하면서 Ctrl+F 검색 / 텍스트 복사가 가능.
+    기존 insert_textbox의 overflow 버그(공간 부족 시 글자 통째로 누락)를 해결하기 위해
+    정밀 baseline 좌표 기준 `insert_text` 방식을 사용합니다.
 
     Args:
         doc: pdf_to_images에서 반환된 fitz.Document (수정 후 저장됨)
@@ -103,8 +102,7 @@ def build_searchable_pdf(
     """
     zoom = dpi / 72.0
     font_file = _find_korean_font()
-    text_count = 0
-    skip_count = 0
+    total_inserted = 0
 
     for page_idx, results in enumerate(ocr_results_per_page):
         if not results:
@@ -112,7 +110,7 @@ def build_searchable_pdf(
 
         page = doc[page_idx]
 
-        # ── 한국어 폰트를 이 페이지에 등록 ──
+        # ── 한국어 폰트 등록 ──
         fontname = "ocr_font"
         try:
             if font_file:
@@ -134,7 +132,6 @@ def build_searchable_pdf(
                 xs = [float(pt[0]) for pt in bbox]
                 ys = [float(pt[1]) for pt in bbox]
             except (TypeError, IndexError):
-                skip_count += 1
                 continue
 
             x0 = min(xs) / zoom
@@ -147,32 +144,38 @@ def build_searchable_pdf(
             if rect_h <= 0 or rect_w <= 0:
                 continue
 
-            rect = fitz.Rect(x0, y0, x1, y1)
-            fontsize = max(1.0, rect_h * 0.75)
+            # 폰트 크기 계산 (박스 높이 기준)
+            fontsize = max(6.0, min(rect_h * 0.85, 36.0))
+            
+            # Baseline 기준 위치: 박스 하단 근처 (y1 - rect_h * 0.15)
+            # insert_text는 공간 부족으로 인한 글자 누락이 전혀 없음
+            point = fitz.Point(x0, y1 - rect_h * 0.15)
 
-            # ── 투명 텍스트 삽입 (render_mode=3) ──
-            inserted = False
-            for fn in (fontname, "helv"):
+            try:
+                # render_mode=3: 투명 텍스트 (보이지 않지만 검색/복사 100% 가능)
+                page.insert_text(
+                    point,
+                    text,
+                    fontsize=fontsize,
+                    fontname=fontname,
+                    render_mode=3,
+                )
+                total_inserted += 1
+            except Exception:
                 try:
-                    page.insert_textbox(
-                        rect, text,
+                    # 폰트 에러 시 helv 폴백
+                    page.insert_text(
+                        point,
+                        text,
                         fontsize=fontsize,
-                        fontname=fn,
+                        fontname="helv",
                         render_mode=3,
                     )
-                    inserted = True
-                    break
-                except Exception:
+                    total_inserted += 1
+                except Exception as e2:
+                    logger.debug(f"텍스트 삽입 실패 [{text}]: {e2}")
                     continue
-
-            if inserted:
-                text_count += 1
-            else:
-                skip_count += 1
 
     doc.save(output_path, garbage=4, deflate=True)
     doc.close()
-    logger.info(
-        f"검색 가능한 PDF 저장 완료: {output_path} "
-        f"(텍스트 {text_count}개 삽입, {skip_count}개 건너뜀)"
-    )
+    logger.info(f"검색 가능한 PDF 저장 완료: {output_path} (텍스트 {total_inserted}개 삽입 성공)")

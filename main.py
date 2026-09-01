@@ -7,6 +7,7 @@ main.py — 한/영 PDF OCR 도구 GUI 진입점
 - ⏹️ 실시간 작업 취소 버튼 지원
 - 페이지 단위 + 파일 단위 실시간 진행률 표시
 - DPI 200 무손실 고속 렌더링
+- OCR 완료 시 팝업 없이 생성된 폴더/파일을 파일 탐색기에서 자동 오픈
 - queue.Queue를 통한 thread-safe 비동기 GUI 업데이트
 """
 
@@ -16,6 +17,7 @@ import queue
 import logging
 import threading
 import traceback
+import subprocess
 from datetime import datetime
 from tkinter import filedialog, messagebox
 
@@ -216,6 +218,19 @@ class PDFOCRApp:
             pass
         self.root.after(100, self._poll_queue)
 
+    def _open_in_explorer(self, target_path: str):
+        """생성된 파일이 위치한 폴더를 파일 탐색기에서 열고 파일을 선택 상태로 표시"""
+        try:
+            abs_path = os.path.abspath(target_path)
+            if sys.platform == "win32":
+                subprocess.Popen(f'explorer /select,"{abs_path}"')
+            else:
+                folder = os.path.dirname(abs_path)
+                subprocess.Popen(["xdg-open", folder])
+            logger.info(f"파일 탐색기 열기 완료: {abs_path}")
+        except Exception as e:
+            logger.warning(f"탐색기 열기 실패: {e}")
+
     def _handle_message(self, msg_type: str, data):
         if msg_type == "engine_ready":
             self.engine_ready = True
@@ -268,9 +283,14 @@ class PDFOCRApp:
             self.cancel_btn.config(state="disabled")
             self.page_progress_var.set(100)
             self.file_progress_var.set(100)
-            total_files = data
-            self.status_label.config(text=f"✅ 전체 {total_files}개 파일 처리 완료!")
-            messagebox.showinfo("완료", f"{total_files}개 파일 OCR 처리가 완료되었습니다.")
+            
+            total_files, last_output_path = data
+            self.status_label.config(text=f"✅ 전체 {total_files}개 파일 처리 완료! (탐색기 열림)")
+            logger.info(f"전체 {total_files}개 파일 처리 완료")
+            
+            # 생성된 파일 위치로 파일 탐색기 자동 오픈 (완료 팝업 없음)
+            if last_output_path and os.path.exists(last_output_path):
+                self._open_in_explorer(last_output_path)
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # 파일 입력 처리
@@ -351,6 +371,8 @@ class PDFOCRApp:
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     def _process_files(self, pdf_files: list):
         total_files = len(pdf_files)
+        last_output_path = ""
+        
         for idx, pdf_path in enumerate(pdf_files):
             if self.cancel_requested:
                 self.msg_queue.put(("cancelled", None))
@@ -360,18 +382,20 @@ class PDFOCRApp:
             self.msg_queue.put(("status", f"📄 {filename} ({idx+1}/{total_files})"))
             self.msg_queue.put(("file_progress", (idx, total_files)))
             try:
-                cancelled = self._process_single_pdf(pdf_path, filename)
+                cancelled, out_path = self._process_single_pdf(pdf_path, filename)
                 if cancelled:
                     self.msg_queue.put(("cancelled", None))
                     return
+                if out_path:
+                    last_output_path = out_path
             except Exception as e:
                 logger.exception(f"파일 처리 실패: {pdf_path}")
                 self.msg_queue.put(("file_error", (filename, str(e))))
 
-        self.msg_queue.put(("all_done", total_files))
+        self.msg_queue.put(("all_done", (total_files, last_output_path)))
 
-    def _process_single_pdf(self, pdf_path: str, filename: str) -> bool:
-        """단일 PDF 처리. 취소 시 True 반환"""
+    def _process_single_pdf(self, pdf_path: str, filename: str) -> tuple[bool, str]:
+        """단일 PDF 처리. (취소여부, 출력파일경로) 반환"""
         logger.info(f"처리 시작: {pdf_path}")
 
         # 1. PDF → 이미지
@@ -384,7 +408,7 @@ class PDFOCRApp:
         for pi, pix in enumerate(pixmaps):
             if self.cancel_requested:
                 doc.close()
-                return True
+                return True, ""
 
             self.msg_queue.put(("page_progress", (pi + 1, total_pages)))
             img_np = pixmap_to_numpy(pix)
@@ -400,7 +424,7 @@ class PDFOCRApp:
 
         self.msg_queue.put(("file_done", os.path.basename(output_path)))
         logger.info(f"처리 완료: {output_path}")
-        return False
+        return False, output_path
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     def run(self):
