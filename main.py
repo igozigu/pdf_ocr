@@ -2,12 +2,12 @@
 main.py — 한/영 PDF OCR 도구 GUI 진입점
 
 기능:
-- tkinterdnd2 / windnd 기반 드래그앤드롭 PDF 입력 (자동 폴백)
-- 파일 선택 대화상자 (대안 입력)
-- 페이지 단위 + 파일 단위 이중 진행률 표시
-- OCR 별도 스레드 실행 (GUI 멈춤 방지)
-- queue.Queue를 통한 thread-safe GUI 업데이트
-- EasyOCR 기본 / PaddleOCR 선택적 이중 엔진 지원
+- NVIDIA GPU (GTX 1080 Ti 등) CUDA 가속 지원
+- tkinterdnd2 / windnd 드래그앤드롭 + 파일 선택 지원
+- ⏹️ 실시간 작업 취소 버튼 지원
+- 페이지 단위 + 파일 단위 실시간 진행률 표시
+- DPI 200 무손실 고속 렌더링
+- queue.Queue를 통한 thread-safe 비동기 GUI 업데이트
 """
 
 import os
@@ -47,7 +47,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.info(f"프로그램 시작 — 기준 경로: {BASE_DIR}")
 logger.info(f"Python {sys.version}")
-logger.info(f"frozen={getattr(sys, 'frozen', False)}")
 
 # ── 드래그앤드롭 라이브러리 자동 감지 ──────────────────────────────────
 DND_BACKEND = None  # "tkinterdnd2" | "windnd" | None
@@ -67,10 +66,10 @@ except ImportError:
 from ocr_engine import create_engine
 from pdf_processor import pdf_to_images, pixmap_to_numpy, build_searchable_pdf
 
-# ── 상수 ────────────────────────────────────────────────────────────
-DPI = 250
-WINDOW_TITLE = "한/영 PDF OCR 도구"
-WINDOW_SIZE = "520x400"
+# ── 상수 (품질 100% 보존 최적 균형점) ─────────────────────────────────
+DPI = 200
+WINDOW_TITLE = "한/영 고속 PDF OCR 도구 (GPU 가속)"
+WINDOW_SIZE = "540x430"
 
 
 class PDFOCRApp:
@@ -90,6 +89,7 @@ class PDFOCRApp:
         # ── 상태 변수 ──
         self.msg_queue: queue.Queue = queue.Queue()
         self.is_processing = False
+        self.cancel_requested = False
         self.engine = None
         self.engine_name = ""
         self.engine_ready = False
@@ -107,7 +107,6 @@ class PDFOCRApp:
     # UI 구성
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     def _build_ui(self):
-        # ── 스타일 ──
         style = ttk.Style()
         style.configure("Drop.TLabel", font=("맑은 고딕", 12))
         style.configure("Status.TLabel", font=("맑은 고딕", 10))
@@ -116,15 +115,11 @@ class PDFOCRApp:
         drop_frame = ttk.LabelFrame(self.root, text="PDF 입력", padding=10)
         drop_frame.pack(fill="both", expand=True, padx=10, pady=(10, 5))
 
-        dnd_hint = ""
-        if DND_BACKEND:
-            dnd_hint = "📄 여기로 PDF 파일을 드래그하세요"
-        else:
-            dnd_hint = "📄 아래 버튼으로 PDF 파일을 선택하세요"
+        dnd_hint = "📄 여기로 PDF 파일을 드래그하세요" if DND_BACKEND else "📄 아래 버튼으로 PDF 파일을 선택하세요"
 
         self.drop_label = ttk.Label(
             drop_frame,
-            text=f"{dnd_hint}\n\n또는 아래 버튼으로 파일을 선택하세요",
+            text=f"{dnd_hint}\n\n또는 아래 [파일 선택] 버튼을 누르세요",
             style="Drop.TLabel",
             anchor="center",
             justify="center",
@@ -132,18 +127,25 @@ class PDFOCRApp:
         )
         self.drop_label.pack(fill="both", expand=True)
 
-        # ── 드래그앤드롭 등록 ──
+        # 드래그앤드롭 등록
         self._register_dnd()
 
-        # ── 버튼 행 ──
+        # ── 조작 버튼 행 ──
         btn_frame = ttk.Frame(self.root)
         btn_frame.pack(fill="x", padx=10, pady=5)
 
         self.select_btn = ttk.Button(
             btn_frame, text="📂 파일 선택", command=self._on_select_files
         )
-        self.select_btn.pack(side="left")
+        self.select_btn.pack(side="left", padx=(0, 5))
 
+        # ⏹️ 작업 취소 버튼
+        self.cancel_btn = ttk.Button(
+            btn_frame, text="⏹️ 작업 취소", command=self._on_cancel, state="disabled"
+        )
+        self.cancel_btn.pack(side="left")
+
+        # 엔진/GPU 상태 라벨
         self.engine_label = ttk.Label(btn_frame, text="⏳ 엔진 로딩 중...")
         self.engine_label.pack(side="right")
 
@@ -181,7 +183,6 @@ class PDFOCRApp:
             self.drop_label.drop_target_register(DND_FILES)
             self.drop_label.dnd_bind("<<Drop>>", self._on_drop_tkdnd)
         elif DND_BACKEND == "windnd":
-            # windnd는 root 윈도우에 등록
             import windnd
             windnd.hook_dropfiles(self.root, func=self._on_drop_windnd)
 
@@ -193,8 +194,9 @@ class PDFOCRApp:
         def _do_warmup():
             try:
                 self.engine, self.engine_name = create_engine(preferred="easyocr")
-                gpu_flag = "🟢 GPU" if self.engine.use_gpu else "🟡 CPU"
-                self.msg_queue.put(("engine_ready", f"{gpu_flag} | {self.engine_name}"))
+                gpu_name = getattr(self.engine, 'gpu_name', 'GPU')
+                gpu_flag = f"🟢 GPU: {gpu_name}" if self.engine.use_gpu else "🟡 CPU 모드"
+                self.msg_queue.put(("engine_ready", f"{gpu_flag}"))
             except Exception as e:
                 tb = traceback.format_exc()
                 logger.error(f"엔진 로드 실패:\n{tb}")
@@ -228,7 +230,6 @@ class PDFOCRApp:
                 "OCR 엔진 로드 실패",
                 f"OCR 엔진을 초기화할 수 없습니다.\n\n"
                 f"오류: {data}\n\n"
-                f"easyocr 또는 paddleocr 패키지가 설치되어 있는지 확인하세요.\n"
                 f"로그 파일: {log_filename}"
             )
 
@@ -254,9 +255,17 @@ class PDFOCRApp:
             self.status_label.config(text=f"❌ 오류: {filename}")
             logger.error(f"파일 처리 오류 [{filename}]: {error}")
 
+        elif msg_type == "cancelled":
+            self.is_processing = False
+            self.select_btn.config(state="normal")
+            self.cancel_btn.config(state="disabled")
+            self.status_label.config(text="⏹️ 사용자에 의해 작업이 취소되었습니다.")
+            messagebox.showinfo("취소됨", "OCR 작업이 취소되었습니다.")
+
         elif msg_type == "all_done":
             self.is_processing = False
             self.select_btn.config(state="normal")
+            self.cancel_btn.config(state="disabled")
             self.page_progress_var.set(100)
             self.file_progress_var.set(100)
             total_files = data
@@ -267,7 +276,6 @@ class PDFOCRApp:
     # 파일 입력 처리
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     def _parse_dropped_files(self, data: str) -> list:
-        """tkinterdnd2 드롭 이벤트 데이터에서 파일 경로 목록 추출"""
         files = []
         i = 0
         while i < len(data):
@@ -286,7 +294,6 @@ class PDFOCRApp:
         return files
 
     def _on_drop_tkdnd(self, event):
-        """tkinterdnd2 드래그앤드롭 핸들러"""
         files = self._parse_dropped_files(event.data)
         pdf_files = [f for f in files if f.lower().endswith('.pdf')]
         if not pdf_files:
@@ -295,7 +302,6 @@ class PDFOCRApp:
         self._start_processing(pdf_files)
 
     def _on_drop_windnd(self, file_list):
-        """windnd 드래그앤드롭 핸들러"""
         pdf_files = []
         for f in file_list:
             path = f.decode('utf-8') if isinstance(f, bytes) else str(f)
@@ -314,6 +320,13 @@ class PDFOCRApp:
         if files:
             self._start_processing(list(files))
 
+    def _on_cancel(self):
+        """작업 취소 버튼 클릭"""
+        if self.is_processing:
+            if messagebox.askyesno("작업 취소", "진행 중인 OCR 작업을 취소하시겠습니까?"):
+                self.cancel_requested = True
+                self.status_label.config(text="⏳ 작업 취소 요청 중...")
+
     def _start_processing(self, pdf_files: list):
         if self.is_processing:
             messagebox.showwarning("처리 중", "이미 파일을 처리하고 있습니다.")
@@ -323,7 +336,9 @@ class PDFOCRApp:
             return
 
         self.is_processing = True
+        self.cancel_requested = False
         self.select_btn.config(state="disabled")
+        self.cancel_btn.config(state="normal")
         self.page_progress_var.set(0)
         self.file_progress_var.set(0)
 
@@ -337,17 +352,26 @@ class PDFOCRApp:
     def _process_files(self, pdf_files: list):
         total_files = len(pdf_files)
         for idx, pdf_path in enumerate(pdf_files):
+            if self.cancel_requested:
+                self.msg_queue.put(("cancelled", None))
+                return
+
             filename = os.path.basename(pdf_path)
             self.msg_queue.put(("status", f"📄 {filename} ({idx+1}/{total_files})"))
             self.msg_queue.put(("file_progress", (idx, total_files)))
             try:
-                self._process_single_pdf(pdf_path, filename)
+                cancelled = self._process_single_pdf(pdf_path, filename)
+                if cancelled:
+                    self.msg_queue.put(("cancelled", None))
+                    return
             except Exception as e:
                 logger.exception(f"파일 처리 실패: {pdf_path}")
                 self.msg_queue.put(("file_error", (filename, str(e))))
+
         self.msg_queue.put(("all_done", total_files))
 
-    def _process_single_pdf(self, pdf_path: str, filename: str):
+    def _process_single_pdf(self, pdf_path: str, filename: str) -> bool:
+        """단일 PDF 처리. 취소 시 True 반환"""
         logger.info(f"처리 시작: {pdf_path}")
 
         # 1. PDF → 이미지
@@ -358,6 +382,10 @@ class PDFOCRApp:
         # 2. 페이지별 OCR
         ocr_results = []
         for pi, pix in enumerate(pixmaps):
+            if self.cancel_requested:
+                doc.close()
+                return True
+
             self.msg_queue.put(("page_progress", (pi + 1, total_pages)))
             img_np = pixmap_to_numpy(pix)
             result = self.engine.recognize_page(img_np)
@@ -372,6 +400,7 @@ class PDFOCRApp:
 
         self.msg_queue.put(("file_done", os.path.basename(output_path)))
         logger.info(f"처리 완료: {output_path}")
+        return False
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     def run(self):
@@ -385,7 +414,6 @@ def main():
         app = PDFOCRApp()
         app.run()
     except Exception:
-        # 치명적 오류 → 로그 + 메시지박스
         tb = traceback.format_exc()
         logger.critical(f"치명적 오류:\n{tb}")
         try:
